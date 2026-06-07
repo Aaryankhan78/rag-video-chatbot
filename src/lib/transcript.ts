@@ -2,6 +2,47 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import { fetchTranscript } from "youtube-transcript";
 
+// Simple retry helper with exponential backoff + jitter
+async function retry<T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  baseDelay = 500
+): Promise<T> {
+  let lastErr: any;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      // treat DNS/network/transient axios errors as retryable
+      const status = err?.response?.status;
+      const code = err?.code;
+      let retryable =
+        code === 'EAI_AGAIN' ||
+        code === 'ENOTFOUND' ||
+        code === 'ECONNRESET' ||
+        code === 'ETIMEDOUT' ||
+        (typeof status === 'number' && status >= 500) ||
+        err?.isAxiosError;
+
+      // HTTP 429 (Too Many Requests) should back off more aggressively
+      let delayMultiplier = 1;
+      if (status === 429) {
+        retryable = true;
+        delayMultiplier = 6; // make backoff longer for 429
+        console.warn('Received HTTP 429, backing off before retrying');
+      }
+
+      if (i === attempts - 1 || !retryable) break;
+
+      const jitter = Math.floor(Math.random() * 200);
+      const delay = baseDelay * Math.pow(2, i) * delayMultiplier + jitter;
+      await new Promise((res) => setTimeout(res, delay));
+    }
+  }
+  throw lastErr;
+}
+
 export interface VideoMetadata {
   videoId: string;
   url: string;
@@ -33,23 +74,36 @@ function extractYouTubeId(url: string): string | null {
 }
 
 async function getYouTubeTranscript(videoId: string): Promise<string> {
+  // Try the official transcript fetch first (with retries)
   try {
-    const transcript = await fetchTranscript(videoId);
+    const transcript = await retry(() => fetchTranscript(videoId), 3, 500);
     const lines = transcript
       .map((segment) => segment.text.replace(/\s+/g, " ").trim())
       .filter(Boolean);
     if (lines.length > 0) return lines.join(" ");
     return "[Transcript not available for this video]";
-  } catch (err) {
-    console.error("transcript fetch failed, falling back to page scrape:", err);
+  } catch (err: any) {
+    console.error("transcript fetch failed, falling back to page scrape:", err?.message || err);
+    const msg = String(err?.message || err || "");
+    if (msg.includes("no longer available") || msg.includes("Video is no longer available")) {
+      return "[Transcript unavailable: video removed or unavailable]";
+    }
+
+    // Fallback: scrape captionTracks from the video page and fetch captions
     try {
       const listUrl = `https://www.youtube.com/watch?v=${videoId}`;
-      const res = await axios.get(listUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      });
+      const res = await retry(
+        () =>
+          axios.get(listUrl, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+              "Accept-Language": "en-US,en;q=0.9",
+            },
+          }),
+        3,
+        500
+      );
+
       const captionMatch = res.data.match(/"captionTracks":\[(.*?)\]/);
       if (!captionMatch) return "[Transcript not available for this video]";
       const trackData = JSON.parse(`[${captionMatch[1]}]`);
@@ -57,7 +111,8 @@ async function getYouTubeTranscript(videoId: string): Promise<string> {
         trackData.find((t: { languageCode: string }) => t.languageCode === "en") ||
         trackData[0];
       if (!englishTrack?.baseUrl) return "[No caption track found]";
-      const transcriptRes = await axios.get(englishTrack.baseUrl);
+
+      const transcriptRes = await retry(() => axios.get(englishTrack.baseUrl), 3, 500);
       const $ = cheerio.load(transcriptRes.data, { xmlMode: true });
       const lines: string[] = [];
       $("text").each((_, el) => {
@@ -65,25 +120,14 @@ async function getYouTubeTranscript(videoId: string): Promise<string> {
         if (text) lines.push(text);
       });
       return lines.join(" ") || "[Transcript not available for this video]";
-    } catch (fallbackErr) {
-      console.error("fallback transcript fetch failed:", fallbackErr);
+    } catch (fallbackErr: any) {
+      console.error("fallback transcript fetch failed:", fallbackErr?.message || fallbackErr);
       return "[Could not fetch transcript]";
     }
   }
 }
-
 async function getYouTubeMetadata(videoId: string): Promise<Partial<VideoMetadata>> {
   try {
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const res = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-
-    const html = res.data;
-
     let title = "";
     let creator = "";
     let views = 0;
@@ -93,6 +137,98 @@ async function getYouTubeMetadata(videoId: string): Promise<Partial<VideoMetadat
     let duration = "";
     let followerCount = "N/A";
     let thumbnailUrl = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+    let hashtags: string[] = [];
+
+    // Prefer the YouTube Data API when an API key is configured
+    if (process.env.YOUTUBE_API_KEY) {
+      try {
+        const statsRes = await retry(
+          () =>
+            axios.get(`https://www.googleapis.com/youtube/v3/videos`, {
+              params: {
+                part: "statistics,snippet",
+                id: videoId,
+                key: process.env.YOUTUBE_API_KEY,
+              },
+            }),
+          3,
+          500
+        );
+
+        const item = statsRes.data.items?.[0];
+        if (item) {
+          views = parseInt(item.statistics.viewCount || "0");
+          likes = parseInt(item.statistics.likeCount || "0");
+          comments = parseInt(item.statistics.commentCount || "0");
+          title = item.snippet.title || title;
+          creator = item.snippet.channelTitle || creator;
+          uploadDate = item.snippet.publishedAt || uploadDate;
+          thumbnailUrl = item.snippet.thumbnails?.maxres?.url || thumbnailUrl;
+
+          const channelId = item.snippet.channelId;
+          if (channelId) {
+            try {
+              const chRes = await retry(
+                () =>
+                  axios.get(`https://www.googleapis.com/youtube/v3/channels`, {
+                    params: {
+                      part: "statistics",
+                      id: channelId,
+                      key: process.env.YOUTUBE_API_KEY,
+                    },
+                  }),
+                3,
+                500
+              );
+              const subs = chRes.data.items?.[0]?.statistics?.subscriberCount;
+              if (subs) {
+                const n = parseInt(subs);
+                followerCount =
+                  n >= 1_000_000
+                    ? (n / 1_000_000).toFixed(1) + "M"
+                    : n >= 1_000
+                    ? (n / 1_000).toFixed(1) + "K"
+                    : n.toString();
+              }
+            } catch {
+              // ignore channel fetch errors
+            }
+          }
+        }
+        console.log(`YouTube API: views=${views} likes=${likes} comments=${comments}`);
+        return {
+          title,
+          creator,
+          views,
+          likes,
+          comments,
+          uploadDate,
+          duration,
+          hashtags,
+          thumbnailUrl,
+          followerCount,
+        };
+      } catch (apiErr) {
+        console.log("YouTube Data API failed, falling back to scraping:", apiErr?.message || apiErr);
+        // fall through to page scraping
+      }
+    }
+
+    // Fallback: scrape the YouTube watch page (use retry)
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const res = await retry(
+      () =>
+        axios.get(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+        }),
+      3,
+      500
+    );
+
+    const html = res.data;
 
     const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
     if (titleMatch) title = titleMatch[1];
@@ -117,73 +253,7 @@ async function getYouTubeMetadata(videoId: string): Promise<Partial<VideoMetadat
     }
 
     const hashtagMatches = html.matchAll(/"#([a-zA-Z0-9_]+)"/g);
-    const hashtags = Array.from(new Set([...hashtagMatches].map((m) => `#${m[1]}`))).slice(0, 10);
-
-    // YouTube Data API - real likes, comments, subscriber count
-    // scraping alone cant get these reliably since youtube hid like counts in 2021
-    if (process.env.YOUTUBE_API_KEY) {
-      try {
-        const [statsRes, channelRes] = await Promise.all([
-          axios.get(`https://www.googleapis.com/youtube/v3/videos`, {
-            params: {
-              part: "statistics,snippet",
-              id: videoId,
-              key: process.env.YOUTUBE_API_KEY,
-            },
-          }),
-          // get channel id first to fetch subscriber count
-          axios.get(`https://www.googleapis.com/youtube/v3/videos`, {
-            params: {
-              part: "snippet",
-              id: videoId,
-              key: process.env.YOUTUBE_API_KEY,
-            },
-          }),
-        ]);
-
-        const item = statsRes.data.items?.[0];
-        if (item) {
-          views = parseInt(item.statistics.viewCount || "0");
-          likes = parseInt(item.statistics.likeCount || "0");
-          comments = parseInt(item.statistics.commentCount || "0");
-          title = item.snippet.title || title;
-          creator = item.snippet.channelTitle || creator;
-          uploadDate = item.snippet.publishedAt || uploadDate;
-
-          // fetch subscriber count using channel id
-          const channelId = item.snippet.channelId;
-          if (channelId) {
-            try {
-              const chRes = await axios.get(
-                `https://www.googleapis.com/youtube/v3/channels`,
-                {
-                  params: {
-                    part: "statistics",
-                    id: channelId,
-                    key: process.env.YOUTUBE_API_KEY,
-                  },
-                }
-              );
-              const subs = chRes.data.items?.[0]?.statistics?.subscriberCount;
-              if (subs) {
-                const n = parseInt(subs);
-                followerCount =
-                  n >= 1_000_000
-                    ? (n / 1_000_000).toFixed(1) + "M"
-                    : n >= 1_000
-                    ? (n / 1_000).toFixed(1) + "K"
-                    : n.toString();
-              }
-            } catch {
-              // subscriber count is optional, not critical
-            }
-          }
-        }
-        console.log(`YouTube API: views=${views} likes=${likes} comments=${comments}`);
-      } catch (apiErr) {
-        console.log("YouTube Data API failed, using scraped data:", apiErr);
-      }
-    }
+    hashtags = Array.from(new Set([...hashtagMatches].map((m) => `#${m[1]}`))).slice(0, 10);
 
     return {
       title,
@@ -198,7 +268,7 @@ async function getYouTubeMetadata(videoId: string): Promise<Partial<VideoMetadat
       followerCount,
     };
   } catch (err) {
-    console.error("metadata fetch failed:", err);
+    console.error("metadata fetch failed:", err?.message || err);
     return {};
   }
 }
