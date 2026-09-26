@@ -209,7 +209,10 @@ async function getYouTubeMetadata(videoId: string): Promise<Partial<VideoMetadat
           followerCount,
         };
       } catch (apiErr) {
-        console.log("YouTube Data API failed, falling back to scraping:", apiErr?.message || apiErr);
+        console.log(
+          "YouTube Data API failed, falling back to scraping:",
+          String(apiErr)
+        );
         // fall through to page scraping
       }
     }
@@ -268,7 +271,7 @@ async function getYouTubeMetadata(videoId: string): Promise<Partial<VideoMetadat
       followerCount,
     };
   } catch (err) {
-    console.error("metadata fetch failed:", err?.message || err);
+    console.error("metadata fetch failed:", String(err));
     return {};
   }
 }

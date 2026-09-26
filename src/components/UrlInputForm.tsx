@@ -34,7 +34,7 @@ export default function UrlInputForm({ onSubmit, loading }: UrlInputFormProps) {
         </div>
         <div className="flex flex-col gap-1.5">
           <label className="text-[10px] font-mono text-[#555] uppercase tracking-wider px-1">
-            Video B · Instagram
+            Video B · Instagram 
           </label>
           <input
             type="url"
